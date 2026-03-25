@@ -4,21 +4,23 @@ Usage:
     python virtue_dev/train_sft.py config.yaml
     python virtue_dev/train_sft.py config.yaml optim_config.lr=3e-4
 
-Liger patches are applied before model loading. Optimizer and scheduler
-plugins are registered at import time via virtue_dev.plugins.
+Liger + fused MoE patches are applied before model loading. Optimizer and
+scheduler plugins are registered at import time via virtue_dev.plugins.
 """
 
 # 1. Register optimizer / scheduler plugins (side effect on import)
 import virtue_dev.plugins as plugins  # noqa: F401
 
-# 2. Apply Liger kernel patches BEFORE any model is loaded
+# 2. Apply kernel patches BEFORE any model is loaded
 plugins.apply_liger_patches()
+plugins.apply_fused_moe_patches()
 
 from llamafactory.v1.accelerator.interface import DistributedInterface
 from llamafactory.v1.config import InputArgument, get_args
 from llamafactory.v1.core.data_engine import DataEngine
 from llamafactory.v1.core.model_engine import ModelEngine
-from llamafactory.v1.trainers.sft_trainer import SFTTrainer
+
+from virtue_dev.trainer import LiteFTTrainer
 
 
 def run_sft(args: InputArgument = None):
@@ -28,28 +30,15 @@ def run_sft(args: InputArgument = None):
     model_engine = ModelEngine(model_args, is_train=True)
 
     # ── Post-load patches ──
-    # Patch Liger LCE forward to separate FA3 kwargs (only needed with FA3 + Liger LCE)
-    # plugins.patch_lce_forward(model_engine.model)
+    plugins.patch_lce_forward(model_engine.model)
+    plugins.apply_neftune(model_engine.model, alpha=5.0)
 
-    # NEFTune: uncomment and set alpha to enable
-    # plugins.apply_neftune(model_engine.model, alpha=5.0)
-
-    trainer = SFTTrainer(
+    trainer = LiteFTTrainer(
         args=training_args,
         model=model_engine.model,
         renderer=model_engine.renderer,
         train_dataset=train_dataset,
     )
-
-    # ── Wrap scheduler with momentum scheduling for Muon ──
-    if training_args.optim_config and training_args.optim_config.name == "muon":
-        trainer.lr_scheduler = plugins.MomentumScheduler(
-            lr_scheduler=trainer.lr_scheduler,
-            optimizer=trainer.optimizer,
-            num_training_steps=trainer.num_training_steps,
-            config=training_args.optim_config,
-        )
-
     trainer.fit()
     trainer.save_model()
     DistributedInterface().destroy()

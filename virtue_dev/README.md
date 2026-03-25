@@ -13,17 +13,31 @@ uv pip install -e .
 uv pip install -r virtue_dev/requirements.txt
 ```
 
-
 ## What's inside
 
-- `plugins.py` — Registers optimizers (Muon, AdamW, AdamW8bit), LR scheduler (warmup-stable-cooldown), and Liger kernel patches via the v1 plugin system.
-- `train_sft.py` — Entry point that loads plugins, applies Liger patches, and runs SFT training.
+- `plugins.py` — All custom components:
+  - **Optimizers**: Muon, AdamW, AdamW8bit
+  - **LR Scheduler**: warmup-stable-cooldown
+  - **Pre-load patches**: Liger kernels (fused RoPE/RMSNorm/Linear CE), fused MoE grouped GEMM
+  - **Post-load patches**: LCE forward (FA3 kwargs separation), NEFTune (embedding noise)
+  - **Momentum scheduling**: Muon momentum warmup/cooldown
+  - **VarlenPackingCollator**: FA3 varlen sequence packing
+- `train_sft.py` — Full entry point: Liger + fused MoE + LCE patch + NEFTune + Muon momentum scheduling.
+- `train_sft_lite.py` — Lite entry point: Liger kernels + custom optimizer/scheduler only.
 - `example_sft.yaml` — Example config using Muon + warmup-stable-cooldown + LoRA.
 
 ## Usage
 
+Full pipeline (Qwen3 MoE with fused kernels + NEFTune):
+
 ```bash
 python virtue_dev/train_sft.py virtue_dev/example_sft.yaml
+```
+
+Lite mode (Liger kernels only, works with any model):
+
+```bash
+python virtue_dev/train_sft_lite.py virtue_dev/example_sft.yaml
 ```
 
 Override config values from CLI:
@@ -35,8 +49,9 @@ python virtue_dev/train_sft.py virtue_dev/example_sft.yaml optim_config.lr=3e-4 
 ## How it works
 
 1. `import virtue_dev.plugins` registers optimizer/scheduler plugins into LlamaFactory's v1 global registry via decorators.
-2. `apply_liger_patches()` monkey-patches transformers module classes (fused RoPE, RMSNorm, linear cross-entropy) before any model is loaded.
-3. `run_sft()` reads the YAML config, resolves `optim_config.name` and `lr_scheduler_config.name` from the registry, and runs training as usual.
+2. Pre-load patches (`apply_liger_patches()`, `apply_fused_moe_patches()`) monkey-patch transformers module classes before any model is loaded.
+3. Post-load patches (`patch_lce_forward()`, `apply_neftune()`) are applied to the loaded model instance.
+4. `MomentumScheduler` wraps the LR scheduler to add Muon momentum warmup/cooldown without modifying the training loop.
 
 ## Adding new components
 

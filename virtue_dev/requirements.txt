@@ -1,3 +1,4 @@
 muon-optimizer @ git+https://github.com/KellerJordan/Muon
+qwen3-moe-fused @ git+https://github.com/woct0rdho/transformers-qwen3-moe-fused
 liger-kernel
 bitsandbytes

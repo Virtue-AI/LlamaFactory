@@ -13,12 +13,13 @@ train_dataset: data/v1_sft_demo.yaml
 
 # ── Training ──
 output_dir: outputs/liteft_sft
-micro_batch_size: 1
+micro_batch_size: 4          # samples to pack into one varlen sequence
 num_train_epochs: 1
 learning_rate: 2e-4
 max_grad_norm: 1.0
-cutoff_len: 2048
+cutoff_len: 8192
 enable_activation_checkpointing: true
+batching_strategy: padding_free   # varlen packing (registered in virtue_dev/plugins.py)
 
 # ── Optimizer plugin (registered in virtue_dev/plugins.py) ──
 optim_config:

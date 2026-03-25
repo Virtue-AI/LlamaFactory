@@ -7,7 +7,6 @@ Import this module before calling run_sft() to register all plugins.
 
 from __future__ import annotations
 
-import sys
 from types import MethodType
 
 import torch
@@ -15,13 +14,14 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from llamafactory.v1.plugins.trainer_plugins.optimizer import OptimizerPlugin
 from llamafactory.v1.plugins.trainer_plugins.lr_scheduler import LRSchedulerPlugin
+from llamafactory.v1.plugins.trainer_plugins.batching import BatchingPlugin
 
 
 # ── Optimizers ───────────────────────────────────────────────────────
 
 
 @OptimizerPlugin("muon").register()
-def create_muon_optimizer(model, config):
+def create_muon_optimizer(model: torch.nn.Module, config):
     """Muon optimizer (requires `pip install muon`).
 
     Config: lr (2e-4), momentum (0.95), weight_decay (0.01).
@@ -38,7 +38,7 @@ def create_muon_optimizer(model, config):
 
 
 @OptimizerPlugin("adamw").register()
-def create_adamw_optimizer(model, config):
+def create_adamw_optimizer(model: torch.nn.Module, config):
     """Standard AdamW optimizer.
 
     Config: lr (6e-5), weight_decay (0.01).
@@ -52,7 +52,7 @@ def create_adamw_optimizer(model, config):
 
 
 @OptimizerPlugin("adamw8bit").register()
-def create_adamw8bit_optimizer(model, config):
+def create_adamw8bit_optimizer(model: torch.nn.Module, config):
     """8-bit AdamW optimizer (requires `pip install bitsandbytes`).
 
     Config: lr (6e-5), weight_decay (0.01).
@@ -61,7 +61,7 @@ def create_adamw8bit_optimizer(model, config):
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     return bnb.optim.AdamW8bit(
-        trainable_params,
+        trainable_params,  # type: ignore[arg-type]
         lr=config.get("lr", 6e-5),
         weight_decay=config.get("weight_decay", 0.01),
     )
@@ -117,14 +117,11 @@ def apply_liger_patches(
     )
 
 
-def apply_fused_moe_patches(fused_moe_path: str | None = None):
+def apply_fused_moe_patches():
     """Apply fused MoE grouped GEMM patches. Must be called BEFORE model loading.
 
-    Requires the transformers-qwen3-moe-fused repo.
+    Requires: uv pip install git+https://github.com/woct0rdho/transformers-qwen3-moe-fused
     """
-    if fused_moe_path is not None:
-        sys.path.insert(0, fused_moe_path)
-
     from qwen3_moe_fused.modular_qwen3_moe_fused import patch_Qwen3MoeSparseMoeBlock_init
     from qwen3_moe_fused.fast_lora import patch_Qwen3MoeFusedSparseMoeBlock_forward
     from qwen3_moe_fused.lora import patch_lora_config
@@ -238,67 +235,123 @@ class MomentumScheduler:
         return getattr(self.lr_scheduler, name)
 
 
-# ── VarlenPackingCollator ────────────────────────────────────────────
+# ── Padding-free batching plugin ─────────────────────────────────────
+
+IGNORE_INDEX = -100
 
 
-class VarlenPackingCollator:
-    """Pack variable-length sequences into fixed-size tensors with cu_seqlens
-    for Flash Attention varlen kernels.
+def _pack_samples(samples: list[dict], cutoff_len: int) -> dict:
+    """Pack variable-length samples into a single sequence with attention_mask
+    encoding for Flash Attention varlen.
 
-    Each batch is packed into shape (1, target_length) with:
-    - cu_seqlens: cumulative sequence lengths for FA varlen
-    - position_ids: per-sequence position indices
+    Each sequence gets a unique integer ID in attention_mask so that
+    transformers' FA integration can compute cu_seqlens internally.
     """
+    packed_ids: list[int] = []
+    packed_labels: list[int] = []
+    packed_weights: list[float] = []
+    seq_lengths: list[int] = []
+    current_length = 0
+    seq_id = 1
 
-    def __init__(self, target_length: int, pad_token_id: int = 0):
-        self.target_length = target_length
-        self.pad_token_id = pad_token_id
-
-    def __call__(self, batch: list[dict]) -> dict:
-        packed_ids: list[int] = []
-        packed_labels: list[int] = []
-        seq_lengths: list[int] = []
-        current_length = 0
-
-        for sample in batch:
-            ids = sample["input_ids"]
-            seq_len = len(ids)
-            if current_length + seq_len > self.target_length:
-                continue
+    for sample in samples:
+        ids = sample["input_ids"]
+        seq_len = len(ids) if isinstance(ids, list) else ids.shape[-1]
+        if current_length + seq_len > cutoff_len:
+            continue
+        if isinstance(ids, list):
             packed_ids.extend(ids)
-            packed_labels.extend(sample["labels"])
-            seq_lengths.append(seq_len)
-            current_length += seq_len
+            packed_labels.extend(sample.get("labels", [IGNORE_INDEX] * seq_len))
+            packed_weights.extend(sample.get("loss_weights", [1.0] * seq_len))
+        else:
+            packed_ids.extend(ids.tolist())
+            packed_labels.extend(sample.get("labels", torch.full((seq_len,), IGNORE_INDEX)).tolist())
+            packed_weights.extend(sample.get("loss_weights", torch.ones(seq_len)).tolist())
+        seq_lengths.append(seq_len)
+        current_length += seq_len
+        seq_id += 1
 
-        # Fallback: if nothing fit, truncate the first sample
-        if not seq_lengths:
-            ids = batch[0]["input_ids"][: self.target_length]
-            labs = batch[0]["labels"][: self.target_length]
-            packed_ids = list(ids)
-            packed_labels = list(labs)
-            seq_lengths = [len(ids)]
-            current_length = len(ids)
+    # Fallback: if nothing fit, truncate the first sample
+    if not seq_lengths:
+        ids = samples[0]["input_ids"][:cutoff_len]
+        labs = samples[0].get("labels", [IGNORE_INDEX] * len(ids))[:cutoff_len]
+        weights = samples[0].get("loss_weights", [1.0] * len(ids))[:cutoff_len]
+        if not isinstance(ids, list):
+            ids, labs, weights = ids.tolist(), labs.tolist(), weights.tolist()
+        packed_ids = list(ids)
+        packed_labels = list(labs)
+        packed_weights = list(weights)
+        seq_lengths = [len(ids)]
+        current_length = len(ids)
 
-        pad_len = self.target_length - current_length
-        if pad_len > 0:
-            packed_ids.extend([self.pad_token_id] * pad_len)
-            packed_labels.extend([-100] * pad_len)
-            seq_lengths.append(pad_len)
+    # Pad to cutoff_len
+    pad_len = cutoff_len - current_length
+    if pad_len > 0:
+        packed_ids.extend([0] * pad_len)
+        packed_labels.extend([IGNORE_INDEX] * pad_len)
+        packed_weights.extend([0.0] * pad_len)
 
-        cu_seqlens = torch.zeros(len(seq_lengths) + 1, dtype=torch.int32)
-        cu_seqlens[1:] = torch.cumsum(
-            torch.tensor(seq_lengths, dtype=torch.int32), dim=0
-        )
-        position_ids = torch.cat(
-            [torch.arange(sl, dtype=torch.long) for sl in seq_lengths]
-        )
+    # Build attention_mask: unique ID per sequence, 0 for padding
+    attention_mask: list[int] = []
+    for i, sl in enumerate(seq_lengths):
+        attention_mask.extend([i + 1] * sl)
+    if pad_len > 0:
+        attention_mask.extend([0] * pad_len)
 
-        return {
-            "input_ids": torch.tensor(packed_ids, dtype=torch.long).unsqueeze(0),
-            "labels": torch.tensor(packed_labels, dtype=torch.long).unsqueeze(0),
-            "position_ids": position_ids.unsqueeze(0),
-            "cu_seqlens": cu_seqlens,
-            "max_seqlen": max(seq_lengths),
-            "num_packed": len(seq_lengths) - (1 if pad_len > 0 else 0),
-            "pad_waste": pad_len,
-        }
+    # Build position_ids: per-sequence positions
+    position_ids: list[int] = []
+    for sl in seq_lengths:
+        position_ids.extend(range(sl))
+    if pad_len > 0:
+        position_ids.extend([0] * pad_len)
+
+    return {
+        "input_ids": torch.tensor(packed_ids, dtype=torch.long).unsqueeze(0),
+        "labels": torch.tensor(packed_labels, dtype=torch.long).unsqueeze(0),
+        "loss_weights": torch.tensor(packed_weights, dtype=torch.float).unsqueeze(0),
+        "attention_mask": torch.tensor(attention_mask, dtype=torch.int32).unsqueeze(0),
+        "position_ids": torch.tensor(position_ids, dtype=torch.long).unsqueeze(0),
+    }
+
+
+@BatchingPlugin("padding_free").register("compute_length")
+def padding_free_compute_length(data_provider):
+    """Estimate number of batches — same as normal since we pack on the fly."""
+    return len(data_provider)
+
+
+@BatchingPlugin("padding_free").register("fill_buffer")
+def padding_free_fill_buffer(buffer, batch_info):
+    """Pull samples into the buffer until we have enough to pack."""
+    micro_batch_size = batch_info["micro_batch_size"]
+    num_micro_batch = batch_info["num_micro_batch"]
+    # Over-fetch to increase packing density
+    target_count = micro_batch_size * num_micro_batch
+    while len(buffer) < target_count:
+        try:
+            samples = next(batch_info["data_iter"])
+        except StopIteration:
+            break
+        buffer.put(samples)
+
+
+@BatchingPlugin("padding_free").register("generate_batch")
+def padding_free_generate_batch(buffer, batch_info):
+    """Pack buffer samples into varlen micro-batches."""
+    micro_batch_size = batch_info["micro_batch_size"]
+    num_micro_batch = batch_info["num_micro_batch"]
+    cutoff_len = batch_info["cutoff_len"]
+    total_needed = micro_batch_size * num_micro_batch
+
+    if len(buffer) < total_needed:
+        return None
+
+    samples = buffer.get(total_needed)
+
+    # Each micro-batch packs micro_batch_size samples into a single sequence
+    batch = []
+    for i in range(num_micro_batch):
+        micro_samples = samples[i * micro_batch_size : (i + 1) * micro_batch_size]
+        batch.append(_pack_samples(micro_samples, cutoff_len))
+
+    return batch

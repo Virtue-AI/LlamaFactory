@@ -157,7 +157,6 @@ class BatchGenerator(Iterator):
             from ...plugins.trainer_plugins.batching import BatchingPlugin
 
             self._length = BatchingPlugin(self.batching_strategy).compute_length(self._data_provider)
-            raise NotImplementedError("Batching strategy other than NORMAL is not supported yet.")
 
     def __len__(self) -> int:
         return self._length
