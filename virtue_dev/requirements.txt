@@ -1,1 +1,3 @@
-muon>=0.1.7
+muon-optimizer @ git+https://github.com/KellerJordan/Muon
+liger-kernel
+bitsandbytes
