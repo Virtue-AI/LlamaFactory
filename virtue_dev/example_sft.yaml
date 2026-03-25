@@ -1,0 +1,42 @@
+# Example: SFT with Muon optimizer + warmup-stable-cooldown scheduler + Liger kernels
+#
+# Usage:
+#   python virtue_dev/train_sft.py virtue_dev/example_sft.yaml
+#   python virtue_dev/train_sft.py virtue_dev/example_sft.yaml learning_rate=3e-4
+
+# ── Model ──
+model: Qwen/Qwen3-0.6B
+template: qwen3_nothink
+
+# ── Data ──
+train_dataset: data/v1_sft_demo.yaml
+
+# ── Training ──
+output_dir: outputs/liteft_sft
+micro_batch_size: 1
+num_train_epochs: 1
+learning_rate: 2e-4
+max_grad_norm: 1.0
+cutoff_len: 2048
+enable_activation_checkpointing: true
+
+# ── Optimizer plugin (registered in virtue_dev/plugins.py) ──
+optim_config:
+  name: muon
+  lr: 2e-4
+  momentum: 0.95
+  weight_decay: 0.01
+
+# ── LR scheduler plugin (registered in virtue_dev/plugins.py) ──
+lr_scheduler_config:
+  name: warmup_stable_cooldown
+  warmup_ratio: 0.05
+  cooldown_ratio: 0.60
+  cooldown_floor: 0.15
+
+# ── PEFT ──
+peft_config:
+  name: lora
+  r: 64
+  alpha: 128
+  target_modules: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
